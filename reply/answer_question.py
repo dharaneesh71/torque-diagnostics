@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Answer a technician question from hybrid retrieval + Qwen, then gate it.
+
+Hybrid search gives the passage text. Qwen2.5-7B-Instruct drafts from those
+rows only. We keep a claim when a retrieved line supports it and cite that
+page. DeBERTa-v3 MNLI covers partial paraphrases that aren't copied
+verbatim. Off-topic asks, or procedures the pages don't state, get the
+domain withhold (indexed ABB manuals only).
+
+Models download once into models/huggingface. BGE + Qwen stay loaded for
+the process; DeBERTa loads on the first paraphrase check and is reused.
+
+    QUESTION='What tools are needed to flange-mount an ACS880-11?' \\
+        uv run python reply/answer_question.py
+
+INDEX_FAMILY forces a folder; otherwise the question text picks it.
+AWS credentials come from the environment (nothing hard-coded here).
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "data-indexing" / "query"))
+sys.path.insert(0, str(ROOT / "data-indexing" / "bm25"))
+sys.path.insert(0, str(ROOT / "data-indexing" / "embeddings"))
+sys.path.insert(0, str(ROOT / "data-indexing" / "tokenization"))
+
+import hf_cache
+from build_bm25 import connect, search
+from build_embeddings import encode_texts, load_encoder, search_vectors
+from chunk_sources import passage_sql_for
+from manual_tokens import route_families
+from query_bm25 import load_payload
+from query_hybrid import fuse, load_embeddings
+
+WRITER_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+ENTAIL_MODEL = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
+DOMAIN_SCOPE = (
+    "ABB drive, motor, and related equipment manuals indexed for Torque Diagnostics"
+)
+# short refusal string we tell Qwen to emit; gate maps it to WITHHOLD
+REFUSAL = "sorry — my domain knowledge is restricted to the indexed abb manuals"
+WITHHOLD = (
+    f"Sorry — my domain knowledge is restricted to {DOMAIN_SCOPE}. "
+    "I only answer from those indexed English manuals with document and page "
+    "citations. This question is outside that scope, or the retrieved pages do "
+    "not support an answer."
+)
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+_CITE = re.compile(r"document\s+([A-Za-z0-9_.+-]+)\s*,\s*page\s+(\d+)", re.IGNORECASE)
+_FILLERS = frozenset(
+    "including include using also such needed need needs following this that with from your have when where into onto what which".split()
+)
+_OPENING = re.compile(r"you need the following tools", re.IGNORECASE)
+_DOMAIN_REFUSAL = re.compile(
+    r"domain knowledge is restricted|retrieved pages do not (?:support|state)",
+    re.IGNORECASE,
+)
+
+
+def content_sentences(answer: str) -> list[str]:
+    parts: list[str] = []
+    for line in answer.splitlines():
+        line = line.strip(" •-\t")
+        if not line:
+            continue
+        parts.extend(part.strip() for part in _SENTENCE.split(line) if part.strip())
+    if not parts and answer.strip():
+        parts = [answer.strip()]
+    return [part for part in parts if re.search(r"[A-Za-z]", part)]
+
+
+def citations(sentence: str) -> list[tuple[str, int]]:
+    return [(doc, int(page)) for doc, page in _CITE.findall(sentence)]
+
+
+def claim_text(sentence: str) -> str:
+    claim = _CITE.sub("", sentence)
+    claim = claim.replace("()", " ")
+    return re.sub(r"\s+", " ", claim).strip(" .;")
+
+
+def is_refusal(answer: str) -> bool:
+    """Check if the text is basically a refuse / withhold reply."""
+    text = answer.strip()
+    if not text:
+        return False
+    if text == WITHHOLD:
+        return True
+    lowered = text.lower()
+    if len(content_sentences(text)) > 3:
+        return False
+    return REFUSAL in lowered or bool(_DOMAIN_REFUSAL.search(lowered))
+
+
+def content_words(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower().replace("-", " "))
+    return {word for word in words if len(word) >= 4 and word not in _FILLERS}
+
+
+def page_lines(text: str) -> list[str]:
+    lines = []
+    for line in text.splitlines():
+        clean = line.strip(" •-\t")
+        if re.search(r"[A-Za-z]", clean):
+            lines.append(clean)
+    return lines
+
+
+_CONTINUE = frozenset("and or to be of the a an in on for with from by as at into onto".split())
+
+
+def page_sentences(text: str) -> list[str]:
+    blocks: list[str] = []
+    buf = ""
+    for line in page_lines(text):
+        first = re.match(r"[A-Za-z]+", line)
+        continues = (
+            bool(buf)
+            and buf[-1] not in ".!?:;"
+            and bool(first)
+            and first.group(0)[:1].islower()
+            and first.group(0).lower() in _CONTINUE
+        )
+        if continues:
+            buf = f"{buf} {line}"
+        else:
+            if buf:
+                blocks.append(buf)
+            buf = line
+    if buf:
+        blocks.append(buf)
+    sentences: list[str] = []
+    for block in blocks:
+        sentences.extend(part.strip() for part in _SENTENCE.split(block) if re.search(r"[A-Za-z]", part))
+    return sentences
+
+
+def covering_sentence(text: str, words: set[str]) -> str | None:
+    """Find a page sentence that covers most of the claim words."""
+    if len(words) < 4:
+        return None
+    found: list[tuple[int, str]] = []
+    for sentence in page_sentences(text):
+        shared = {word for word in words if word in sentence.lower()}
+        if len(shared) >= 4 and len(shared) / len(words) >= 0.6:
+            found.append((len(shared), sentence))
+    if not found:
+        return None
+    return min(found, key=lambda item: (-item[0], len(item[1])))[1]
+
+
+def best_line(text: str, claim_words: set[str]) -> tuple[str, float] | None:
+    """Best overlapping line on the page + overlap score."""
+    best: str | None = None
+    best_score = 0.0
+    for line in page_lines(text):
+        words = content_words(line)
+        if len(words) < 2 or not claim_words:
+            continue
+        score = len(words & claim_words) / len(words)
+        if score > best_score or (score == best_score and best is not None and len(line) < len(best)):
+            best = line
+            best_score = score
+    if best is None or best_score < 0.34:
+        return None
+    return best, best_score
+
+
+def opening_line(text: str) -> str | None:
+    for line in page_lines(text):
+        if _OPENING.search(line):
+            return line.rstrip(":").strip()
+    return None
+
+
+def clauses(claim: str) -> list[str]:
+    pieces: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    index = 0
+    lowered = claim.lower()
+    while index < len(claim):
+        char = claim[index]
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+        if depth == 0 and char in ",;":
+            part = "".join(buf).strip(" .;")
+            if re.search(r"[A-Za-z]", part):
+                pieces.append(part)
+            buf = []
+            index += 1
+            continue
+        if depth == 0 and lowered.startswith(" and ", index):
+            part = "".join(buf).strip(" .;")
+            if re.search(r"[A-Za-z]", part):
+                pieces.append(part)
+            buf = []
+            index += 5
+            continue
+        buf.append(char)
+        index += 1
+    tail = "".join(buf).strip(" .;")
+    if re.search(r"[A-Za-z]", tail):
+        pieces.append(tail)
+    return pieces or [claim]
+
+
+def cite_label(rows: list[dict]) -> str:
+    seen: list[tuple[str, int]] = []
+    for row in rows:
+        ident = (row["document_id"], row["page_number"])
+        if ident not in seen:
+            seen.append(ident)
+    return "; ".join(f"document {doc}, page {page}" for doc, page in seen)
+
+
+def sources_footer(rows: list[dict]) -> str:
+    """One citation line at the end of the answer (doc id + page)."""
+    label = cite_label(rows)
+    if not label:
+        return ""
+    return f"More information can be found in {label}."
+
+
+def gate(answer: str, passages: list[dict], entails, question: str = "") -> str:
+    """Keep supported draft sentences, attach sources, or withhold.
+
+    Prefer Qwen's wording when a retrieved page supports the claim (exact
+    copy, strong word overlap, or DeBERTa entailment). Drop unsupported
+    claims. If nothing survives, return WITHHOLD. Streamlit just shows
+    whatever string this returns.
+    """
+    if is_refusal(answer):
+        return WITHHOLD
+    question_words = content_words(question)
+    kept: list[tuple[str, list[dict]]] = []
+    seen_wording: set[str] = set()
+    for sentence in content_sentences(answer):
+        claim = claim_text(sentence).rstrip(".").strip()
+        if not re.search(r"[A-Za-z]", claim):
+            continue
+        novel = content_words(claim) - question_words
+        covered: list[tuple[int, str, dict]] = []
+        if len(novel) >= 3:
+            for row in passages:
+                page_sentence = covering_sentence(row["text"], novel)
+                if page_sentence:
+                    shared = sum(word in page_sentence.lower() for word in novel)
+                    covered.append((shared, page_sentence.rstrip(".").strip(), row))
+        if covered:
+            best_shared = max(item[0] for item in covered)
+            # Keep fluent Qwen wording; cite every page that covers the claim.
+            rows = [item[2] for item in covered if item[0] == best_shared]
+            if claim.lower() not in seen_wording:
+                seen_wording.add(claim.lower())
+                kept.append((claim, rows))
+            continue
+        # Whole-sentence support: keep fluent multi-fact drafts when most claim
+        # words appear in retrieved pages (avoids chopping tool lists on commas).
+        if novel:
+            supporters: list[dict] = []
+            for row in passages:
+                blob = row["text"].lower()
+                hit = sum(1 for word in novel if word in blob)
+                ratio = hit / len(novel)
+                found = best_line(row["text"], novel)
+                line = found[0] if found else None
+                if ratio >= 0.5 or (found and found[1] >= 0.40) or (
+                    line and ratio >= 0.34 and entails(line, claim)
+                ):
+                    supporters.append(row)
+            if supporters and claim.lower() not in seen_wording:
+                seen_wording.add(claim.lower())
+                kept.append((claim, supporters))
+                continue
+        for part in clauses(claim):
+            part = part.rstrip(".").strip()
+            novel = content_words(part) - question_words
+            if not novel:
+                continue
+            supporters = []
+            for row in passages:
+                found = best_line(row["text"], content_words(part))
+                line = found[0] if found else None
+                exact = any(
+                    line_text.lower().rstrip(".:") == part.lower().rstrip(".:")
+                    for line_text in page_lines(row["text"])
+                )
+                # Slightly looser overlap (0.40) before DeBERTa; still require support.
+                if exact:
+                    supporters.append(row)
+                elif found and (found[1] >= 0.40 or entails(line, part)):
+                    supporters.append(row)
+            if not supporters:
+                continue
+            # Prefer the drafted clause for fluency; citations still attached.
+            wording = part
+            if wording.lower() in seen_wording:
+                continue
+            seen_wording.add(wording.lower())
+            kept.append((wording, supporters))
+    long_answer = any(len(content_words(wording)) >= 6 for wording, _rows in kept)
+    kept = [
+        item
+        for item in kept
+        if not (
+            long_answer and len(content_words(item[0])) <= 2
+        )
+        and not any(
+            item[0].lower() != other[0].lower()
+            and (
+                item[0].lower() in other[0].lower()
+                or (
+                    content_words(item[0])
+                    and all(word in other[0].lower() for word in content_words(item[0]))
+                )
+            )
+            for other in kept
+        )
+    ]
+    if not kept:
+        return WITHHOLD
+    # put citations at the end so the answer reads more naturally
+    body = " ".join(
+        (wording if wording.endswith((".", "!", "?")) else f"{wording}.")
+        for wording, _rows in kept
+    )
+    all_rows: list[dict] = []
+    for _wording, rows in kept:
+        all_rows.extend(rows)
+    footer = sources_footer(all_rows)
+    return f"{body} {footer}".strip()
+
+
+def retrieve(question: str, families: list[str], k: int) -> list[dict]:
+    query_vector = encode_texts(load_encoder(), [question], query=True)[0]
+    found: list[dict] = []
+    for family in families:
+        bm25_hits = search(load_payload(family), question, max(k, 10**9))
+        matrix, rows = load_embeddings(family)
+        embed_hits = search_vectors(matrix, rows, query_vector, len(rows) or k)
+        for hit in fuse(bm25_hits, embed_hits, k):
+            hit["asset_family"] = family
+            found.append(hit)
+    found.sort(key=lambda hit: hit["score"], reverse=True)
+    return found[:k]
+
+
+def load_texts(hits: list[dict]) -> list[dict]:
+    if not hits:
+        return []
+    connection = connect() if not os.environ.get("CHUNK_PARQUET", "").strip() else __import__("duckdb").connect()
+    by_id: dict[str, dict] = {}
+    by_family: dict[str, list[dict]] = {}
+    for hit in hits:
+        by_family.setdefault(hit["asset_family"], []).append(hit)
+    for family, family_hits in by_family.items():
+        wanted = {str(hit["chunk_id"]) for hit in family_hits}
+        id_list = ", ".join("'" + chunk_id.replace("'", "''") + "'" for chunk_id in sorted(wanted))
+        rows = connection.execute(
+            f"""
+            SELECT chunk_id, document_id, page_number, text
+            FROM ({passage_sql_for(family)}) sources
+            WHERE chunk_id IN ({id_list})
+            """
+        ).fetchall()
+        for chunk_id, document_id, page_number, text in rows:
+            if str(chunk_id) in wanted and str(text or "").strip():
+                by_id[str(chunk_id)] = {
+                    "chunk_id": str(chunk_id),
+                    "document_id": str(document_id),
+                    "page_number": int(page_number),
+                    "text": str(text),
+                }
+    # keep retrieval order for the prompt
+    return [by_id[str(hit["chunk_id"])] for hit in hits if str(hit["chunk_id"]) in by_id]
+
+
+_writer: tuple | None = None
+_entails = None
+
+
+def load_writer():
+    """Load Qwen once and reuse it for later calls."""
+    global _writer
+    if _writer is not None:
+        return _writer
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    device_map = "auto" if torch.cuda.is_available() else "cpu"
+    tokenizer, tokenizer_source = hf_cache.from_pretrained(AutoTokenizer, WRITER_MODEL)
+    model, model_source = hf_cache.from_pretrained(
+        AutoModelForCausalLM,
+        WRITER_MODEL,
+        dtype=dtype,
+        device_map=device_map,
+    )
+    source = "huggingface" if "huggingface" in {tokenizer_source, model_source} else "cache"
+    print(f"writer={WRITER_MODEL} source={source}", flush=True)
+    _writer = (tokenizer, model)
+    return _writer
+
+
+def draft(question: str, passages: list[dict]) -> str:
+    blocks = []
+    for row in passages:
+        heading = f"document {row['document_id']}, page {row['page_number']}"
+        blocks.append(f"{heading}\n{row['text']}")
+    system = (
+        "You are a technician assistant for ABB drive manuals. "
+        "Write a clear, fluent answer in plain language a technician can follow. "
+        "Use only facts stated in the passages. Keep equipment names, fault codes, "
+        "tool names, and parameter values exactly as written. "
+        "You may rephrase for readability and use short connecting sentences, "
+        "but do not invent tools, steps, values, or warnings the passages omit. "
+        "Prefer complete sentences over bullet lists. "
+        "Do not name a document id or a page number — citations are added later. "
+        "Your knowledge is limited to ABB drive, motor, and related equipment manuals. "
+        "If the question is outside that subject, or none of the passages support an "
+        f"answer, reply only: {REFUSAL}."
+    )
+    user = "Passages:\n\n" + "\n\n".join(blocks) + f"\n\nQuestion: {question}"
+    tokenizer, model = load_writer()
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    output = model.generate(
+        **inputs,
+        max_new_tokens=500,
+        do_sample=True,
+        temperature=0.35,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    text = tokenizer.decode(output[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
+    return text.strip()
+
+
+def _load_entails():
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    tokenizer, tokenizer_source = hf_cache.from_pretrained(AutoTokenizer, ENTAIL_MODEL)
+    model, model_source = hf_cache.from_pretrained(
+        AutoModelForSequenceClassification,
+        ENTAIL_MODEL,
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    labels = {int(index): name.lower() for index, name in model.config.id2label.items()}
+    entail_index = next(index for index, name in labels.items() if name == "entailment")
+    source = "huggingface" if "huggingface" in {tokenizer_source, model_source} else "cache"
+    print(f"checker={ENTAIL_MODEL} source={source}", flush=True)
+
+    def entails(premise: str, hypothesis: str) -> bool:
+        encoded = tokenizer(
+            premise,
+            hypothesis,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        )
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        with torch.no_grad():
+            logits = model(**encoded).logits[0]
+        return int(torch.argmax(logits).item()) == entail_index
+
+    return entails
+
+
+def entailment_checker():
+    """Lazy DeBERTa wrapper — loads on first real call."""
+
+    def entails(premise: str, hypothesis: str) -> bool:
+        global _entails
+        if _entails is None:
+            _entails = _load_entails()
+        return _entails(premise, hypothesis)
+
+    return entails
+
+
+def main() -> int:
+    question = os.environ.get("QUESTION", "").strip()
+    if not question:
+        print("Set QUESTION to the technician question.", file=sys.stderr)
+        return 1
+    override = os.environ.get("INDEX_FAMILY", "").strip()
+    families = [override] if override else route_families(question)
+    k = int(os.environ.get("TOP_K", "15"))
+    print(f"folders: {', '.join(families)}", flush=True)
+    hits = retrieve(question, families, k)
+    passages = load_texts(hits)
+    if not passages:
+        print(WITHHOLD)
+        return 0
+    answer = draft(question, passages)
+    released = gate(answer, passages, entailment_checker(), question)
+    print(released)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
